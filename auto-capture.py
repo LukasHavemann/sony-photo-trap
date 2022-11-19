@@ -4,10 +4,11 @@ import threading
 import time
 from collections import deque
 from queue import Queue
+from queue import Empty
 
 camaddress = "http://192.168.122.1:8080/sony/camera" #Older models like NEX-5T, a6000, ... (Also make sure that your remote control app on the cam itself is up to date)
 #camaddress = "http://192.168.122.1:10000/sony/camera" #Newer models like a6400, a7iii, ... (Note the missing trailing slash)
-sharpnessAverageCount = 1000 #Number of frames to average to get the "base sharpness"
+sharpnessAverageCount = 100 #Number of frames to average to get the "base sharpness"
 relativeTriggerIncrease = 1.25 #Camera is triggered if the sharpness rises by this factor above the base sharpness
 
 
@@ -51,61 +52,81 @@ def analyzeStream(triggerCameraEvent):
 
     print("Start analyzing current sharpness...")
     while running:
-        frame = frameQueue.get()
-        i += 1
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        mean, std = cv2.meanStdDev(laplacian)
-        focus = std[0][0]*std[0][0]
-        focusQueue.append(focus)
-        if len(focusQueue) > sharpnessAverageCount:
-            focusQueue.popleft()
-            focusavg = sum(focusQueue)/len(focusQueue)
-            if focus/focusavg > relativeTriggerIncrease:
-                #This is it, there is something here. Take a pic!
-                if not triggerCameraEvent.isSet():
-                    triggerCameraEvent.set()
-                    print("Trigger!!")
+        try:
+            frame = frameQueue.get(timeout = 1)
+            i += 1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+            mean, std = cv2.meanStdDev(laplacian)
+            focus = std[0][0]*std[0][0]
+            focusQueue.append(focus)
+            if len(focusQueue) > sharpnessAverageCount:
+                focusQueue.popleft()
+                focusavg = sum(focusQueue)/len(focusQueue)
+                if focus/focusavg > relativeTriggerIncrease:
+                    #This is it, there is something here. Take a pic!
+                    if not triggerCameraEvent.isSet():
+                        triggerCameraEvent.set()
+                        print("Trigger!!")
+                else:
+                    if triggerCameraEvent.isSet():
+                        triggerCameraEvent.clear()
+                        print("Stop triggering")
+                if i % 25 == 0:
+                    print("---")
+                    tnow = time.time()
+                    print("Analyzing at " + str(25/(tnow-t)) + " fps")
+                    print("Base sharpness: " + str(focusavg))
+                    print("Current sharpness: " + str(focus))
+                    t = tnow
             else:
-                if triggerCameraEvent.isSet():
-                    triggerCameraEvent.clear()
-                    print("Stop triggering")
-            if i % 25 == 0:
-                print("---")
-                tnow = time.time()
-                print("Analyzing at " + str(25/(tnow-t)) + " fps")
-                print("Base sharpness: " + str(focusavg))
-                print("Current sharpness: " + str(focus))
-                t = tnow
-        else:
-            if i % 25 == 0:
-                print("Collecting sample frames: " + str(len(focusQueue)) + "/" + str(sharpnessAverageCount))
+                if i % 25 == 0:
+                    print("Collecting sample frames: " + str(len(focusQueue)) + "/" + str(sharpnessAverageCount))
+        except Empty: 
+            pass
 
 
-def take_picture(triggerCameraEvent): 
+def take_picture(triggerCameraEvent, pictureResultQueue): 
     while running: 
-        if triggerCameraEvent.wait(): 
+        if triggerCameraEvent.wait(1): 
             print("Request camera to take a picture.")
-            time.sleep(3)
             payload = {"version": "1.0", "id": 1, "method": "actTakePicture", "params": []}
             r = requests.post(camaddress, json=payload)
             response = r.json()
             print("Response: " + str(response))
-            url = response["result"][0][0]
+            if "result" in response :
+                url = response["result"][0][0]
+                print("Downloading from URL: " + str(url))
+                r = requests.get(url)
+                open("pictures/" + time.strftime("%Y%m%d_%H%M%S") + ".jpg", "wb").write(r.content)
+                print("Done.")                
+
+def download_results(pictureResultQueue): 
+    while running: 
+        try:
+            url = pictureResultQueue.get(timeout = 1)
             print("Downloading from URL: " + str(url))
             r = requests.get(url)
             open("pictures/" + time.strftime("%Y%m%d_%H%M%S") + ".jpg", "wb").write(r.content)
-            print("Done.")
+            print("Done.")    
+        except Empty:
+            pass
 
 
 running = True
 frameQueue = Queue()
+videoFrameQueue = Queue()
+pictureResultQueue = Queue()
 triggerCameraEvent = threading.Event()
 
-triggerCameraThread = threading.Thread(target=take_picture, args=[triggerCameraEvent])
+triggerCameraThread = threading.Thread(target=take_picture, args=[triggerCameraEvent, pictureResultQueue])
 triggerCameraThread.start()
 analyzeThread = threading.Thread(target=analyzeStream, args=[triggerCameraEvent])
 analyzeThread.start()
+downloadResultsThread = threading.Thread(target=download_results, args=[pictureResultQueue])
+downloadResultsThread.start()
+
+
 
 connect_to_camera()
 url = get_preview_stream()
@@ -113,11 +134,13 @@ url = get_preview_stream()
 print("Opening video stream...")
 cap = cv2.VideoCapture(url)
 
+
 try:
     while running:
         success, frame = cap.read()
         if success:
             frameQueue.put(frame)
+            videoFrameQueue.put(frame)
             cv2.imshow('show', frame)
             k = cv2.waitKey(1)
             if k == ord('q'):
@@ -132,5 +155,10 @@ print("waiting for thread shutdown")
 #Clean up
 cap.release()
 cv2.destroyAllWindows()
+print("cap devices down")
 analyzeThread.join()
+print("analyzeThread")
 triggerCameraThread.join()
+print("triggerCamera")
+downloadResultsThread.join()
+print("download Results")
